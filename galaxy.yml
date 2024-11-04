@@ -1,0 +1,30 @@
+namespace: marzekan
+
+name: portainer
+
+version: 1.0.0
+
+readme: README.md
+
+authors:
+  - marzekan
+
+description: Automate Portainer initial setup and stack deployment
+
+license:
+  - GPL-3.0-or-later
+
+tags:
+  - portainer
+
+dependencies: {}
+
+repository: https://github.com/marzekan/ansible-portainer
+
+documentation: https://github.com/marzekan/ansible-portainer
+
+homepage: https://github.com/marzekan/ansible-portainer
+
+issues: https://github.com/marzekan/ansible-portainer/issues
+
+build_ignore: []
