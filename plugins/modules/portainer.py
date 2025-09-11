@@ -142,30 +142,45 @@ class PortainerAPI:
             self.ansible_module.warn(f"Cannot reach portainer - check IP and port.")
             raise
 
-    def _request(self, rtype : str, api_endpoint : str, **kwargs):
-        """ Abstraction of requests so we can properly decorate it in one place """
+    def __request(self, _method, api_endpoint : str, ignoreAuthHeaders : bool = False, **kwargs):
+        """ Abstraction of requests so we can properly decorate it in
+        one place. ignoreAuthHeaders does what it says on the tin.
+        kwargs passed on to requests.request."""
         
-        ret = None
+        # Initialize headers, either empty or whatever has been passed
+        # from kwargs
+        if 'headers' in kwargs:
+            headers = kwargs['headers']
 
-        # Determine which auth method to use
-        if self.useAPIToken:
-            headers = { "X-API-Key": self.token}
         else:
-            headers = { "Authorization": f"Bearer {self.token}" }
+            headers = {}
 
-        if rtype == "post":
-            ret = requests.post(
-                f"{self.root_url}/api/{api_endpoint}",
-                headers = headers,
-                verify = self.verify,
-                **kwargs
+        # Determine which auth method to use, 
+        if not ignoreAuthHeaders:
+            if self.useAPIToken:
+                headers["X-API-Key"] = self.token
+            else:
+                headers["Authorization"] = f"Bearer {self.token}"
+
+        new_kwargs = dict(
+            filter(
+                lambda x: x[0] not in ["headers", "verify"], 
+                kwargs.items()
             )
-        elif rtype == "get":
-            ret = requests.get(f"{self.root_url}/api/{api_endpoint}", headers = headers, verify=self.verify, **kwargs)
-        else:
-            raise Exception("invalid request type")
+        )
 
-        return ret
+        return _method(
+            f"{self.root_url}/api/{api_endpoint}",
+            headers = headers,
+            verify = self.verify,
+            **new_kwargs
+        )
+    
+    def _get(self, *args, **kwargs):
+        return self.__request(requests.get, *args, **kwargs)
+
+    def _post(self, *args, **kwargs):
+        return self.__request(requests.post, *args, **kwargs)
 
 
     def create_admin(self, admin_username: str, admin_password: str):
@@ -181,6 +196,7 @@ class PortainerAPI:
         try:
             response = requests.post(
                 f"{self.root_url}/api/users/admin/init",
+                ignoreAuthHeaders = True,
                 json=body,
                 verify=self.verify
             )
@@ -203,7 +219,7 @@ class PortainerAPI:
 
         try:
 
-            response = self._request("get", f"users/admin/check")
+            response = self._get(f"users/admin/check")
             if response.status_code == 204:
                 self.ansible_module.warn(f"Portainer already initialized, skipping 'initial_setup'...")
                 return True
@@ -222,12 +238,12 @@ class PortainerAPI:
         self.ansible_module.log(f"Creating endpoint {endpoint_name}")
 
         form_data = {
-            "Name": f"{endpoint_name}",
+            "Name": endpoint_name,
             "EndpointCreationType": 1
         }
 
         try:
-            response = self._request("post", f"endpoints", data=form_data)
+            response = self._post(f"endpoints", data=form_data)
 
             response.raise_for_status()
 
@@ -256,7 +272,7 @@ class PortainerAPI:
         }
 
         try:
-            response = self._request("post", f"auth", data=body)
+            response = self._post(f"auth", data=body)
             response.raise_for_status()
             self.ansible_module.log(f"SUCCESS: Logged in as {admin_username} - token received.")
 
@@ -274,7 +290,7 @@ class PortainerAPI:
         self.ansible_module.log(f"Getting all stacks")
        
         try:
-            response = self._request("get", f"stacks")
+            response = self._get(f"stacks")
             response.raise_for_status()
             stacks = [stack['Name'] for stack in response.json()]
             self.ansible_module.log(f"Received {len(stacks)} stacks")
@@ -292,7 +308,7 @@ class PortainerAPI:
         self.ansible_module.log(f"Getting endpoints")
 
         try:
-            response = self._request("get", f"endpoints")
+            response = self._get(f"endpoints")
 
             response.raise_for_status()
             endpoints = response.json()
@@ -324,6 +340,8 @@ class PortainerAPI:
 
     def create_stack(self, stack_name: str, docker_compose_file: str, endpoint_id: int) -> bool:
 
+        ret = False
+
         self.ansible_module.log(f"Creating stack - {stack_name}")
 
         form_data = {
@@ -339,7 +357,7 @@ class PortainerAPI:
         }
 
         try:
-            response = self._request("post",
+            response = self._post(
                 f"stacks/create/standalone/file",
                 data=form_data,
                 files=compose_file,
@@ -347,12 +365,15 @@ class PortainerAPI:
 
             response.raise_for_status()
             self.ansible_module.log(f"SUCCESS: {stack_name} stack created")
-            return True
+            ret = True
 
         except requests.exceptions.RequestException as e:
             e.args = (f"ERROR (create_stack): '{stack_name}' failed to create. Exception: {e}",)
             self.ansible_module.log(f"{e}")
-            return False
+        finally:
+            compose_file['file'].close()
+        
+        return ret
 
 
 def main():
@@ -403,17 +424,23 @@ def main():
 
         admin_exists = portainer.check_admin_exists()
 
+        # Perform the initial setup if desired and not running in check
+        # mode
+        if initial_setup_param and not module.check_mode:
+            portainer.create_admin(admin_username_param, admin_password_param)
+
+        # Create a session token if we are not using an api token
         if not portainer.useAPIToken:
-            if initial_setup_param and not admin_exists:
-                portainer.create_admin(admin_username_param, admin_password_param)
-                portainer.create_session(admin_username_param, admin_password_param)
-                portainer.create_endpoint(endpoint_param)
-            else:
-                portainer.create_session(admin_username_param, admin_password_param)
+            portainer.create_session(admin_username_param, admin_password_param)
+
+        # Create the endpoint (if desired by initial_setup) when not
+        # running in check mode
+        if initial_setup_param and not module.check_mode:
+            portainer.create_endpoint(endpoint_param)
 
         endpoint_id = portainer.get_endpoint_id(endpoint_param)
         existing_stacks = portainer.get_all_stacks()
-        created_stacks=[]
+        created_stacks = []
 
         for stack in stacks_param:
             stack_name = stack['name']
@@ -423,14 +450,19 @@ def main():
                 module.warn(f"Stack '{stack_name}' already exists, skipping...")
                 continue
             
-            stack_created = portainer.create_stack(stack_name, stack_compose_file, endpoint_id)
-            created_stacks.append(stack_created)
+            if not module.check_mode:
+                stack_created = portainer.create_stack(stack_name, stack_compose_file, endpoint_id)
+                created_stacks.append(stack_created)
+            else:
+                # Assume that the stack will be sucessfully created on the
+                # portainer instance
+                created_stacks.append(True)
     
     except Exception as e:
         module.fail_json(changed=False, msg=f"{e}")
         return
 
-    changed_status = True if created_stacks.count(True) > 0 else False
+    changed_status = len(created_stacks) > 0
     message_status = f"{len(created_stacks)} stacks created"
 
     module.exit_json(
